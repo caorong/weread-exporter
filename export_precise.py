@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.request
 
-from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
 
 USER_DATA_DIR = os.path.join("cache", "browser_profile")
 
@@ -650,6 +650,29 @@ def backup_existing_export(book_dir, output_root):
     return backup_dir
 
 
+async def ensure_vertical_reading_mode(page, headless=False):
+    """Require normal (vertical scrolling) mode before reading the catalog."""
+    vertical = page.locator("button.readerControls_item.isNormalReader")
+    horizontal = page.locator("button.readerControls_item.isHorizontalReader")
+    if await horizontal.count():
+        message = (
+            "当前为横向翻页模式。导出前必须切换为纵向（上下滚动）阅读模式，"
+            "否则可能出现目录跳转失败或正文缺失。")
+        if headless:
+            raise ExportError(message + "请先用普通模式运行，在浏览器中切换。")
+        print(f"\n  ⚠️  {message}", flush=True)
+        print("  请在当前浏览器的阅读器侧边工具栏点击阅读模式切换按钮；"
+              "切换后自动继续，最多等待 2 分钟。", flush=True)
+        try:
+            await vertical.wait_for(state="visible", timeout=120000)
+        except PlaywrightTimeoutError as exc:
+            raise ExportError("等待切换纵向阅读模式超时，请重新运行并完成模式切换。") from exc
+        await asyncio.sleep(3)
+    if not await vertical.count():
+        raise ExportError("无法识别阅读模式，请确认书籍已加载，并使用纵向（上下滚动）阅读模式。")
+    print("  ✅ 已确认纵向阅读模式")
+
+
 async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                       resume_after_title=None, resume_after_index=None,
                       catalog_path=None, headless=False):
@@ -690,6 +713,7 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                             wait_until="networkidle", timeout=30000)
             await asyncio.sleep(5)
 
+            await ensure_vertical_reading_mode(page, headless=headless)
             book_title, book_author = await fetch_book_title(page)
             target_index, catalog_titles = await goto_catalog_chapter(
                 page, resume_after_title=resume_after_title,
@@ -901,6 +925,7 @@ async def main(book_id, output_root="output", restart=False, headless=False):
     print("=" * 60)
     print("  weread-exporter — 精确图文导出 v3")
     print("=" * 60)
+    print("  使用前请确保微信读书已切换为纵向（上下滚动）阅读模式。", flush=True)
     os.makedirs(USER_DATA_DIR, exist_ok=True)
     book_dir = os.path.join(output_root, book_id)
     if restart:
