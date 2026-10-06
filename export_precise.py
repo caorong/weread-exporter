@@ -2,9 +2,8 @@
 """
 微信读书导出 — 精确图文版 v3
 
-逐页捕获：每翻一页，抓当前视口内的 canvas 文字 + 视口内图片，
-按屏幕 y 坐标把文字行和图片交错排序，图片精确落在对应段落之间。
-双页拆分(左页→右页)，按目录精确切分并自动续传。
+纵向捕获：按各 Canvas 和 DOM 的文档坐标排列文字与图片，
+确认目录标题起点，滚动至下一节或当前内容末尾后保存，支持断点续传。
 """
 import argparse
 import asyncio
@@ -44,71 +43,114 @@ def resolve_chromium_executable(playwright):
 CANVAS_HOOK = """
 (function() {
     window.__wr_chars = [];
+    window.__wr_canvas_chars = new WeakMap();
+    for (const dimension of ['width', 'height']) {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, dimension);
+        Object.defineProperty(HTMLCanvasElement.prototype, dimension, {
+            ...descriptor, set(value) {
+                window.__wr_canvas_chars.delete(this);
+                descriptor.set.call(this, value);
+            }
+        });
+    }
+    var origClear = CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect = function(x, y, w, h) {
+        const chars = window.__wr_canvas_chars.get(this.canvas);
+        if (chars) {
+            const transform = this.getTransform();
+            const a = transform.transformPoint(new DOMPoint(x, y));
+            const b = transform.transformPoint(new DOMPoint(x + w, y + h));
+            for (const [key, c] of chars) {
+                if (c.x >= Math.min(a.x, b.x) && c.x <= Math.max(a.x, b.x) &&
+                    c.y >= Math.min(a.y, b.y) && c.y <= Math.max(a.y, b.y)) chars.delete(key);
+            }
+        }
+        return origClear.apply(this, arguments);
+    };
     var origFill = CanvasRenderingContext2D.prototype.fillText;
     CanvasRenderingContext2D.prototype.fillText = function(text, x, y) {
-        if (text && text.trim())
+        if (text && text.trim()) {
             window.__wr_chars.push({t: text, x: Math.round(x*10)/10, y: Math.round(y*10)/10});
+            let chars = window.__wr_canvas_chars.get(this.canvas);
+            if (!chars) {
+                chars = new Map();
+                window.__wr_canvas_chars.set(this.canvas, chars);
+            }
+            const transform = this.getTransform();
+            const metrics = this.measureText(text);
+            const top = y - (metrics.fontBoundingBoxAscent || 0);
+            const point = transform.transformPoint(new DOMPoint(x, top));
+            chars.set(x + ',' + y, {t: text, x: point.x, y: point.y});
+        }
         return origFill.apply(this, arguments);
+    };
+    // The reader also copies an offscreen text canvas into its displayed canvas.
+    var origDraw = CanvasRenderingContext2D.prototype.drawImage;
+    CanvasRenderingContext2D.prototype.drawImage = function(source, ...args) {
+        const drawn = window.__wr_canvas_chars.get(source);
+        if (drawn) {
+            let sx = 0, sy = 0, sw = source.width, sh = source.height;
+            let dx, dy, dw, dh;
+            if (args.length === 2) [dx, dy, dw, dh] = [...args, sw, sh];
+            else if (args.length === 4) [dx, dy, dw, dh] = args;
+            else [sx, sy, sw, sh, dx, dy, dw, dh] = args;
+            let dest = window.__wr_canvas_chars.get(this.canvas);
+            if (!dest) {
+                dest = new Map();
+                window.__wr_canvas_chars.set(this.canvas, dest);
+            }
+            const transform = this.getTransform();
+            for (const c of Array.from(drawn.values())) {
+                if (c.x < sx || c.x >= sx + sw || c.y < sy || c.y >= sy + sh) continue;
+                const point = transform.transformPoint(new DOMPoint(
+                    dx + (c.x - sx) * dw / sw, dy + (c.y - sy) * dh / sh));
+                dest.set(point.x + ',' + point.y, {t: c.t, x: point.x, y: point.y});
+            }
+        }
+        return origDraw.call(this, source, ...args);
     };
     window.__wr_reset = function() { window.__wr_chars = []; };
     window.__wr_count = function() { return window.__wr_chars.length; };
 })();
 """
 
-# 当前视口内可见的书籍插图，带屏幕坐标
-VIEWPORT_IMGS_JS = """
+# Project each canvas independently into document coordinates. A vertical reader
+# may have several tall canvases plus a virtualized DOM character layer.
+DOCUMENT_SNAPSHOT_JS = """
 () => {
-    const H = window.innerHeight, W = window.innerWidth, out = [];
-    document.querySelectorAll('img[class*="wr_readerImage"]').forEach(i => {
-        const src = i.src || i.getAttribute('data-src') || '';
-        if (!src.includes('res.weread.qq.com/wrepub')) return;
-        const r = i.getBoundingClientRect();
-        if (r.width > 40 && r.height > 40 && r.bottom > 0 && r.top < H &&
-            r.right > 0 && r.left < W &&
-            getComputedStyle(i).visibility !== 'hidden' &&
-            getComputedStyle(i).display !== 'none') {
-            out.push({src, top: Math.round(r.top), left: Math.round(r.left),
-                      w: i.naturalWidth||i.width, h: i.naturalHeight||i.height});
+    const chars = [], images = [];
+    let untrackedCanvases = 0;
+    const root = document.querySelector('.renderTargetContent');
+    if (!root) return null;
+    for (const canvas of document.querySelectorAll('canvas')) {
+        const rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height || !canvas.width || !canvas.height) continue;
+        const drawn = window.__wr_canvas_chars?.get(canvas);
+        if (!drawn) { untrackedCanvases++; continue; }
+        for (const c of drawn.values()) chars.push({t: c.t,
+            x: rect.left + c.x * rect.width / canvas.width,
+            y: rect.top + scrollY + c.y * rect.height / canvas.height});
+    }
+    for (const el of root.querySelectorAll('.wr_absolute')) {
+        const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+        if (!rect.width || !rect.height || style.display === 'none' ||
+                style.visibility === 'hidden') continue;
+        if (el.tagName === 'IMG') {
+            const src = el.src || el.getAttribute('data-src') || '';
+            if (src.includes('res.weread.qq.com/wrepub') && rect.width > 40 && rect.height > 40)
+                images.push({src, top: rect.top + scrollY,
+                    w: el.naturalWidth || el.width, h: el.naturalHeight || el.height});
+        } else if (el.textContent.trim()) {
+            chars.push({t: el.textContent, x: rect.left, y: rect.top + scrollY});
         }
-    });
-    return out;
+    }
+    return {chars, images, untrackedCanvases, y: scrollY, height: innerHeight,
+        maxY: Math.max(0, document.documentElement.scrollHeight - innerHeight)};
 }
-"""
-
-# reader 的两个 canvas 的屏幕位置
-CANVAS_RECTS_JS = """
-() => Array.from(document.querySelectorAll('canvas')).map(c => {
-    const r = c.getBoundingClientRect();
-    return {top: r.top, left: r.left, w: Math.round(r.width), h: Math.round(r.height)};
-}).filter(r => r.h > 300)
-"""
-
-# Canvas 已绘制但滚动到内部目录锚点时不会再次触发 fillText。
-# 微信读书保留的绝对定位字符层可作为这种场景的兜底数据源。
-DOM_CHARS_JS = """
-() => Array.from(document.querySelectorAll('.renderTargetContent .wr_absolute'))
-    .map(el => {
-        const r = el.getBoundingClientRect();
-        return {t: el.textContent || '', x: r.left, y: r.top};
-    })
-    .filter(c => c.t.trim())
 """
 
 MEASURE_RE = re.compile(r'^[a-zA-Z0-9`~!@#$%^&*()\-_=+\[\]{}|;:\',<.>/?\\"\s]+$')
 SENTENCE_END = set("。！？；：」）】》…—")
-
-
-def split_spread(chars):
-    """双页拆分：返回 [左页chars, 右页chars] 或 [单页chars]"""
-    if len(chars) < 20:
-        return [chars]
-    singles = [(i, c) for i, c in enumerate(chars) if len(c["t"]) == 1]
-    if len(singles) < 10:
-        return [chars]
-    for j in range(1, len(singles)):
-        if singles[j - 1][1]["y"] > 400 and singles[j][1]["y"] < 200:
-            return [chars[:singles[j][0]], chars[singles[j][0]:]]
-    return [chars]
 
 
 def chars_to_lines(chars):
@@ -126,67 +168,6 @@ def chars_to_lines(chars):
         if line.strip():
             lines.append({"y": yk, "text": line.strip()})
     return lines
-
-
-def build_page_blocks(chars, images, canvas_rects, seen_imgs):
-    """把一次渲染(可能双页)拆成有序块列表: [{type:'text'/'img', ...}]
-       文字行和图片按屏幕 y 交错；左页整页在前，右页在后。"""
-    blocks = []
-    pages = split_spread(chars)
-
-    # 判定左右 canvas
-    rects = sorted(canvas_rects, key=lambda r: r["left"])
-    left_rect = rects[0] if rects else {"top": 0, "left": 0}
-    right_rect = rects[1] if len(rects) > 1 else left_rect
-    mid_x = (left_rect["left"] + right_rect["left"]) / 2 + 180 if len(rects) > 1 else 99999
-
-    # 图片按左右分组
-    left_imgs = [im for im in images if im["left"] < mid_x]
-    right_imgs = [im for im in images if im["left"] >= mid_x]
-
-    def emit_page(page_chars, page_rect, page_imgs):
-        lines = chars_to_lines(page_chars)
-        items = []
-        for ln in lines:
-            items.append(("text", page_rect["top"] + ln["y"], ln["text"]))
-        for im in page_imgs:
-            if im["src"] in seen_imgs:
-                continue
-            items.append(("img", im["top"], im))
-        items.sort(key=lambda t: t[1])
-        for typ, _y, payload in items:
-            if typ == "text":
-                blocks.append({"type": "text", "text": payload})
-            else:
-                seen_imgs.add(payload["src"])
-                blocks.append({"type": "img", "src": payload["src"],
-                                "w": payload["w"], "h": payload["h"]})
-
-    if len(pages) == 2:
-        emit_page(pages[0], left_rect, left_imgs)
-        emit_page(pages[1], right_rect, right_imgs)
-    else:
-        # 单页：图片全归这页，仍按 y 排
-        emit_page(pages[0], left_rect, left_imgs + right_imgs)
-    return blocks
-
-
-def build_dom_blocks(chars, images, seen_imgs):
-    items = [("text", line["y"], line["text"]) for line in chars_to_lines(chars)]
-    for image in images:
-        if image["src"] not in seen_imgs:
-            items.append(("img", image["top"], image))
-    items.sort(key=lambda item: item[1])
-
-    blocks = []
-    for block_type, _y, payload in items:
-        if block_type == "text":
-            blocks.append({"type": "text", "text": payload})
-        else:
-            seen_imgs.add(payload["src"])
-            blocks.append({"type": "img", "src": payload["src"],
-                           "w": payload["w"], "h": payload["h"]})
-    return blocks
 
 
 def img_filename(url, ch_idx, seq):
@@ -229,7 +210,7 @@ def render_chapter_md(ch_title, blocks, ch_idx):
             flush_para()
             img_seq += 1
             fname = img_filename(b["src"], ch_idx, img_seq)
-            out.append(f"![图](images/{fname})")
+            out.append(f"![图](../images/{fname})")
             img_records.append({"url": b["src"], "file": fname})
     flush_para()
 
@@ -271,7 +252,10 @@ def load_catalog_titles(catalog_path):
 
 
 def canonical_title(title):
-    return re.sub(r"\s+", "", title or "")
+    # EPUB renderers insert zero-width break markers around punctuation.
+    value = re.sub(r"[\s\u200b\u2060\ufeff\u00ad]+", "", title or "")
+    # Printed division titles may decorate the leading label: ｜上编｜动态篇.
+    return re.sub(r"^[|｜]([^|｜]+)[|｜]", r"\1", value)
 
 
 def resolve_catalog_title(candidate, catalog_titles):
@@ -349,47 +333,43 @@ def next_catalog_title(catalog_titles, resume_after_title=None):
     return catalog_titles[index] if index is not None else None
 
 
+def heading_span(blocks, title, start=0):
+    """Match an entire heading, including consecutive wrapped title lines."""
+    key = canonical_title(title)
+    for i in range(start, len(blocks)):
+        value = ""
+        for j in range(i, min(i + 6, len(blocks))):
+            if blocks[j].get("type") != "text":
+                break
+            value += canonical_title(blocks[j].get("text", ""))
+            if value == key:
+                return i, j + 1
+            if not key.startswith(value):
+                break
+    return None
+
+
 def partition_catalog_sections(blocks, current_index, catalog_titles):
-    """Split rendered content into catalog-indexed sections."""
+    """Split only at adjacent catalog headings; never jump to a distant namesake."""
     if not 0 <= current_index < len(catalog_titles):
         raise ExportError(f"当前目录下标无效: {current_index}")
-
-    indexes_by_key = {}
+    sections, complete = {}, {}
+    cursor = 0
     for index in range(current_index, len(catalog_titles)):
-        key = canonical_title(catalog_titles[index])
-        indexes_by_key.setdefault(key, []).append(index)
-
-    sections = {current_index: []}
-    complete = {current_index: False}
-    active_index = current_index
-    saw_current_marker = False
-
-    for block in blocks:
-        marker_index = None
-        if block.get("type") == "text":
-            candidates = indexes_by_key.get(
-                canonical_title(block.get("text", "")), [])
-            if (not saw_current_marker and active_index == current_index and
-                    current_index in candidates):
-                marker_index = current_index
-            else:
-                marker_index = next(
-                    (index for index in candidates if index > active_index), None)
-
-        if marker_index is not None:
-            if marker_index == current_index and not saw_current_marker:
-                sections[current_index] = []
-                active_index = current_index
-                saw_current_marker = True
-                continue
-            if marker_index != active_index:
-                complete[active_index] = True
-                active_index = marker_index
-                sections.setdefault(active_index, [])
-                complete.setdefault(active_index, False)
-                continue
-
-        sections.setdefault(active_index, []).append(block)
+        heading = heading_span(blocks, catalog_titles[index], cursor)
+        body_start = heading[1] if heading else cursor
+        next_heading = (heading_span(blocks, catalog_titles[index + 1], body_start)
+                        if index + 1 < len(catalog_titles) else None)
+        end = next_heading[0] if next_heading else len(blocks)
+        prefix = blocks[cursor:heading[0]] if heading else []
+        # A title page may have a cover above its heading. Do not keep preceding
+        # prose from another section when locating an internal chapter anchor.
+        images = prefix if prefix and all(b.get("type") == "img" for b in prefix) else []
+        sections[index] = images + list(blocks[body_start:end])
+        complete[index] = next_heading is not None
+        if next_heading is None:
+            break
+        cursor = next_heading[0]
     return sections, complete
 
 
@@ -437,6 +417,83 @@ def merge_block_sequences(existing, incoming):
             overlap = size
             break
     return list(existing) + list(incoming[overlap:])
+
+
+def merge_positioned_blocks(existing, incoming):
+    """Combine document snapshots without appending repeated render windows."""
+    result = list(existing)
+    for block in incoming:
+        signature = (block["type"], block.get("text", block.get("src")))
+        duplicate = next((i for i, old in enumerate(result)
+                          if (old["type"], old.get("text", old.get("src"))) == signature
+                          and (block["type"] == "img" or
+                               abs(old["y"] - block["y"]) <= 6)), None)
+        if duplicate is None:
+            result.append(block)
+        else:
+            result[duplicate] = block
+    return sorted(result, key=lambda block: block["y"])
+
+
+async def capture_catalog_section(page, current_index, catalog_titles, start_timeout=10):
+    """Read one verified section, including images below the initial viewport."""
+    blocks = []
+    initial_y = await page.evaluate("() => window.scrollY")
+    title = catalog_titles[current_index]
+    snapshots = 0
+    load_deadline = asyncio.get_running_loop().time() + start_timeout
+    try:
+        for _ in range(200):
+            snapshot = await page.evaluate(DOCUMENT_SNAPSHOT_JS)
+            if snapshot is None:
+                raise ExportError("正文容器不存在，无法提取章节")
+            incoming = [{"type": "text", "text": line["text"], "y": line["y"]}
+                        for line in chars_to_lines(snapshot["chars"])]
+            incoming += [{"type": "img", "src": im["src"], "w": im["w"],
+                          "h": im["h"], "y": im["top"]} for im in snapshot["images"]]
+            blocks = merge_positioned_blocks(blocks, incoming)
+            snapshots += 1
+
+            candidates = []
+            cursor = 0
+            while (match := heading_span(blocks, title, cursor)) is not None:
+                candidates.append(match)
+                cursor = match[1]
+            heading = min(candidates, key=lambda span:
+                          abs(blocks[span[0]]["y"] - initial_y - 100)) if candidates else None
+            if heading is None:
+                # A separate illustration/cover page may have no printed title.
+                if (blocks and all(b["type"] == "img" for b in blocks) and
+                        not snapshot.get("untrackedCanvases", 0) and
+                        await _selected_catalog_index(page) == current_index):
+                    heading = (0, 0)
+                else:
+                    if asyncio.get_running_loop().time() < load_deadline:
+                        blocks = []
+                        await asyncio.sleep(.5)
+                        continue
+                    raise ExportError(f"未在正文中确认章节起点「{title}」，拒绝保存未定位内容")
+            next_heading = (heading_span(blocks, catalog_titles[current_index + 1], heading[1])
+                            if current_index + 1 < len(catalog_titles) else None)
+            at_bottom = snapshot["y"] >= snapshot["maxY"] - 2
+            reached_next = (next_heading is not None and
+                            blocks[next_heading[0]]["y"] <= snapshot["y"] + snapshot["height"])
+            if at_bottom or reached_next:
+                end = next_heading[0] if next_heading else len(blocks)
+                prefix = blocks[:heading[0]]
+                # Preserve cover artwork only when there is no preceding prose.
+                prefix = prefix if all(b["type"] == "img" for b in prefix) else []
+                content = prefix + blocks[heading[1]:end]
+                return content, snapshots, not content
+
+            next_y = min(snapshot["maxY"], snapshot["y"] + max(400, snapshot["height"] * .75))
+            await page.evaluate("y => window.scrollTo(0, y)", next_y)
+            await asyncio.sleep(.35)
+            await wait_stable(page)
+        raise ExportError(f"章节「{title}」扫描超出限制，未确认结束位置")
+    finally:
+        await page.evaluate("y => window.scrollTo(0, y)", initial_y)
+        await asyncio.sleep(.3)
 
 
 async def _title(page, catalog_titles=None):
@@ -512,15 +569,17 @@ async def _catalog_index_matches(page, expected_index, catalog_titles):
     # Reconstruct whole lines: the reader usually stores one DOM node per glyph.
     # Reject partially clipped lines instead of matching a visible title prefix.
     hidden_rows = {round(c["y"] / 3) * 3 for c in chars if not c["visible"]}
-    matches = [line for line in chars_to_lines(chars)
-               if canonical_title(line["text"]) == title_key]
-    return len(matches) == 1 and matches[0]["y"] not in hidden_rows
+    lines = [{"type": "text", **line} for line in chars_to_lines(chars)]
+    match = heading_span(lines, catalog_titles[expected_index])
+    return (match is not None and
+            heading_span(lines, catalog_titles[expected_index], match[1]) is None and
+            all(line["y"] not in hidden_rows for line in lines[match[0]:match[1]]))
 
 
 async def _open_catalog(page):
     if not await _catalog_is_open(page):
         await page.click("button.readerControls_item.catalog", timeout=5000)
-    await page.locator(".readerCatalog_list_item").first.wait_for(
+    await page.locator(".readerCatalog_list_item:visible").first.wait_for(
         state="visible", timeout=5000)
     await asyncio.sleep(0.35)
 
@@ -601,15 +660,35 @@ async def goto_catalog_chapter(page, resume_after_title=None,
     return target_index, titles
 
 
+async def capture_verified_section(page, current_index, catalog_titles):
+    try:
+        return await capture_catalog_section(page, current_index, catalog_titles)
+    except ExportError:
+        # Rebuild the render state once; never save a failed capture as empty.
+        print(f"  ↻ 重新加载并核对「{catalog_titles[current_index]}」", flush=True)
+        await page.reload(wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        recovered_index, recovered_titles = await goto_catalog_chapter(
+            page, resume_after_index=current_index - 1 if current_index else None)
+        if recovered_index != current_index or recovered_titles != catalog_titles:
+            raise ExportError("重新加载后目录发生变化，已停止导出")
+        return await capture_catalog_section(page, current_index, catalog_titles)
+
+
 def save_chapter(ch_title, blocks, ch_idx, md_dir, raw_dir,
-                 catalog_index=None):
+                 catalog_index=None, title_only=False):
     if not ch_title.strip():
         raise ExportError("拒绝保存标题为空的章节")
+    if title_only and blocks:
+        raise ExportError("仅标题章节不应包含正文块")
     body, img_records = render_chapter_md(ch_title, blocks, ch_idx)
     text_len = sum(len(b["text"]) for b in blocks if b["type"] == "text")
     with open(os.path.join(md_dir, f"{ch_idx:04d}.md"), "w") as f:
         f.write(body)
-    record = {"title": ch_title, "images": img_records, "text_len": text_len}
+    record = {"title": ch_title, "images": img_records, "text_len": text_len,
+              "capture_version": 2}
+    if title_only:
+        record["title_only_verified"] = True
     if catalog_index is not None:
         record["catalog_index"] = catalog_index
     with open(os.path.join(raw_dir, f"{ch_idx:04d}.json"), "w") as f:
@@ -639,7 +718,9 @@ def validate_export(catalog_titles, md_dir, raw_dir):
             continue
         if not title:
             errors.append(f"{filename} 的章节标题为空")
-        if not record.get("text_len", 0) and not record.get("images", []):
+        if (not record.get("text_len", 0) and not record.get("images", []) and
+                not (record.get("capture_version") == 2 and
+                     record.get("title_only_verified") is True)):
             errors.append(f"{filename}「{title or '(无标题)'}」没有捕获到文字或图片")
         catalog_index = record.get("catalog_index")
         if (catalog_index is not None and catalog_index != expected_index and
@@ -705,7 +786,7 @@ async def ensure_vertical_reading_mode(page, headless=False):
     print("  ✅ 已确认纵向阅读模式")
 
 
-async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
+async def run_session(book_id, md_dir, raw_dir, start_idx,
                       resume_after_title=None, resume_after_index=None,
                       catalog_path=None, headless=False):
     async with async_playwright() as p:
@@ -742,26 +823,24 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             await page.add_init_script(CANVAS_HOOK)
             print("\n  打开阅读器...")
             await page.goto(f"https://weread.qq.com/web/reader/{book_id}",
-                            wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(5)
+                            wait_until="domcontentloaded", timeout=30000)
+            await page.locator(
+                "button.readerControls_item.isNormalReader, "
+                "button.readerControls_item.isHorizontalReader").first.wait_for(
+                    state="visible", timeout=30000)
+            await asyncio.sleep(2)
 
             await ensure_vertical_reading_mode(page, headless=headless)
             book_title, book_author = await fetch_book_title(page)
+            if catalog_path:
+                with open(os.path.join(os.path.dirname(catalog_path), "_book.json"), "w") as f:
+                    json.dump({"title": book_title, "author": book_author}, f, ensure_ascii=False)
             target_index, catalog_titles = await goto_catalog_chapter(
                 page, resume_after_title=resume_after_title,
                 resume_after_index=resume_after_index,
                 catalog_path=catalog_path)
             if target_index is None:
                 return book_title, book_author, 0, 0, start_idx, True
-
-            catalog_levels = await page.evaluate(r"""() => Array.from(
-                document.querySelectorAll('.readerCatalog_list_item')).map(el => {
-                    const inner = el.querySelector('.readerCatalog_list_item_inner');
-                    const match = inner?.className.match(/readerCatalog_list_item_level_(\d+)/);
-                    return match ? Number(match[1]) : 1;
-                })""")
-            if len(catalog_levels) != len(catalog_titles):
-                catalog_levels = [1] * len(catalog_titles)
 
             current_index = await _wait_for_catalog_index(
                 page, target_index, catalog_titles)
@@ -780,97 +859,6 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             ch_blocks = []
             total_chars = 0
             chapters_this_session = 0
-            prefetched_blocks = {}
-            prefetched_complete = {}
-
-            def cache_future_sections(sections, complete):
-                for section_index, blocks in sections.items():
-                    if section_index == current_index:
-                        continue
-                    prefetched_blocks[section_index] = merge_block_sequences(
-                        prefetched_blocks.get(section_index, []), blocks)
-                    prefetched_complete[section_index] = (
-                        prefetched_complete.get(section_index, False) or
-                        complete.get(section_index, False))
-
-            async def capture_current_page():
-                """抓当前页的有序块，累加到 ch_blocks；返回是否有新内容"""
-                nonlocal ch_blocks
-                await asyncio.sleep(0.3)
-                chars = await page.evaluate("() => window.__wr_chars")
-                before = len(ch_blocks)
-                new_blocks = prefetched_blocks.pop(current_index, [])
-                section_complete = prefetched_complete.pop(current_index, False)
-
-                if chars:
-                    rects = await page.evaluate(CANVAS_RECTS_JS)
-                    imgs = await page.evaluate(VIEWPORT_IMGS_JS)
-                    scratch_seen = set(seen_imgs)
-                    rendered_blocks = build_page_blocks(
-                        chars, imgs, rects, scratch_seen)
-                    sections, complete = partition_catalog_sections(
-                        rendered_blocks, current_index, catalog_titles)
-                    new_blocks = merge_block_sequences(
-                        new_blocks, sections.get(current_index, []))
-                    section_complete = (
-                        section_complete or complete.get(current_index, False))
-                    cache_future_sections(sections, complete)
-                current_level = catalog_levels[current_index]
-                needs_dom_fallback = (
-                    not section_complete and (not chars or current_level > 1))
-                if needs_dom_fallback:
-                    initial_scroll = await page.evaluate("() => window.scrollY")
-                    scan_section = current_index < len(catalog_titles) - 1
-                    try:
-                        for _ in range(20):
-                            dom_chars = await page.evaluate(DOM_CHARS_JS)
-                            imgs = await page.evaluate(VIEWPORT_IMGS_JS)
-                            scratch_seen = set(seen_imgs)
-                            scratch_seen.update(
-                                block["src"] for block in new_blocks
-                                if block.get("type") == "img")
-                            window_blocks = build_dom_blocks(
-                                dom_chars, imgs, scratch_seen)
-                            sections, complete = partition_catalog_sections(
-                                window_blocks, current_index, catalog_titles)
-                            current_window = sections.get(current_index, [])
-                            found_next = complete.get(current_index, False)
-                            cache_future_sections(sections, complete)
-                            if (not found_next and not await _catalog_index_matches(
-                                    page, current_index, catalog_titles)):
-                                break
-                            new_blocks = merge_block_sequences(
-                                new_blocks, current_window)
-                            if found_next or not scan_section:
-                                break
-
-                            scroll_state = await page.evaluate("""() => ({
-                                y: window.scrollY,
-                                maxY: Math.max(0, document.documentElement.scrollHeight - innerHeight),
-                                step: Math.max(400, Math.floor(innerHeight * 0.75)),
-                            })""")
-                            if scroll_state["y"] >= scroll_state["maxY"] - 2:
-                                break
-                            next_y = min(
-                                scroll_state["maxY"],
-                                scroll_state["y"] + scroll_state["step"])
-                            await page.evaluate("y => window.scrollTo(0, y)", next_y)
-                            await asyncio.sleep(0.4)
-                    finally:
-                        current_scroll = await page.evaluate("() => window.scrollY")
-                        if abs(current_scroll - initial_scroll) > 1:
-                            await page.evaluate(
-                                "y => window.scrollTo(0, y)", initial_scroll)
-                            await asyncio.sleep(0.3)
-                            await _wait_for_catalog_index(
-                                page, current_index, catalog_titles, timeout=3)
-
-                for block in new_blocks:
-                    if block.get("type") == "img":
-                        seen_imgs.add(block["src"])
-                ch_blocks = merge_block_sequences(ch_blocks, new_blocks)
-                return len(ch_blocks) > before
-
             while True:
                 expected_index = target_index + chapters_this_session
                 if expected_index >= len(catalog_titles):
@@ -882,17 +870,18 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                         f"目录下标未单调前进: 期望 {expected_index}，"
                         f"实际 {current_index}，已中止")
 
-                page_num = 1 if await capture_current_page() else 0
+                ch_blocks, page_num, title_only = await capture_verified_section(
+                    page, current_index, catalog_titles)
                 n, imgs = save_chapter(
                     current_chapter, ch_blocks, ch_idx, md_dir, raw_dir,
-                    catalog_index=current_index)
+                    catalog_index=current_index, title_only=title_only)
                 total_chars += n
                 note = f" +{len(imgs)}图" if imgs else ""
                 end_note = (
                     " [全书末尾]"
                     if current_index == len(catalog_titles) - 1 else "")
                 print(f"  [{ch_idx:4d}] {current_chapter[:32]:32s} "
-                      f"{n:6d}字 ({page_num}页){note}{end_note}")
+                      f"{n:6d}字 ({page_num}次采样){note}{end_note}")
                 chapters_this_session += 1
                 ch_idx += 1
 
@@ -959,17 +948,28 @@ async def main(book_id, output_root="output", restart=False, headless=False):
     for d in (md_dir, raw_dir, img_dir):
         os.makedirs(d, exist_ok=True)
 
-    seen_imgs = set()
-    for jf in os.listdir(raw_dir):
-        if jf.endswith(".json"):
-            for img in json.load(open(os.path.join(raw_dir, jf))).get("images", []):
-                seen_imgs.add(img["url"])
-
     catalog_path = os.path.join(book_dir, "_catalog.json")
     book_title = book_author = ""
+    export_complete = False
+    try:
+        with open(os.path.join(book_dir, "_book.json")) as f:
+            metadata = json.load(f)
+        catalog_titles = load_catalog_titles(catalog_path)
+        current_capture = True
+        for filename in os.listdir(raw_dir):
+            if filename.endswith(".json"):
+                with open(os.path.join(raw_dir, filename)) as f:
+                    current_capture &= json.load(f).get("capture_version") == 2
+        if (metadata.get("title") and catalog_titles and current_capture and
+                not validate_export(catalog_titles, md_dir, raw_dir)):
+            book_title, book_author = metadata["title"], metadata.get("author", "")
+            export_complete = True
+            print("  ✅ 已有完整章节，直接校验图片并合并，无需重开浏览器。")
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
     session = 0
     no_progress_sessions = 0
-    while True:
+    while not export_complete:
         session += 1
         last_title, last_idx = get_last_chapter_title(md_dir)
         if last_idx > 0 and not last_title:
@@ -981,7 +981,7 @@ async def main(book_id, output_root="output", restart=False, headless=False):
         print(f"  上次: {last_title or '(无)'}, 编号: {last_idx}")
         try:
             title, author, added, chars_added, _end_idx, reached_end = await run_session(
-                book_id, md_dir, raw_dir, start_idx, seen_imgs,
+                book_id, md_dir, raw_dir, start_idx,
                 resume_after_title=last_title,
                 resume_after_index=last_idx - 1 if last_idx > 0 else None,
                 catalog_path=catalog_path,
@@ -1027,7 +1027,10 @@ async def main(book_id, output_root="output", restart=False, headless=False):
         out.write(f"# {book_title}\n\n**{book_author}**\n\n---\n\n")
         for fn in total_files:
             with open(os.path.join(md_dir, fn)) as chapter_file:
-                out.write(chapter_file.read())
+                content = chapter_file.read()
+                content = content.replace("](../images/", f"]({book_id}/images/")
+                content = content.replace("](images/", f"]({book_id}/images/")
+                out.write(content)
             out.write("\n\n---\n\n")
     print(f"\n{'=' * 60}")
     print(f"  ✅ 全书导出完成!  📖 {book_title} — {book_author}")
