@@ -2,9 +2,12 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from export_precise import (
     ExportError,
+    _catalog_index_matches,
+    _wait_for_catalog_index,
     backup_existing_export,
     get_last_chapter_title,
     merge_block_sequences,
@@ -16,6 +19,47 @@ from export_precise import (
     select_catalog_section_blocks,
     validate_export,
 )
+
+
+class CatalogNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bottom_heading_accepts_stale_highlight_and_keeps_target_index(self):
+        titles = ["上一节", "男命婚配忌日", "下一章"]
+        chars = [{"t": char, "x": i * 20, "y": 255, "visible": True}
+                 for i, char in enumerate(titles[1])]
+        page = AsyncMock()
+        page.evaluate.return_value = list(reversed(chars))
+        with patch("export_precise._selected_catalog_index", return_value=0):
+            self.assertEqual(await _wait_for_catalog_index(page, 1, titles), 1)
+
+    async def test_bottom_fallback_rejects_missing_clipped_or_ambiguous_heading(self):
+        heading = {"t": "目标节", "x": 0, "y": 255, "visible": True}
+        cases = [
+            ([], ["上一节", "目标节"]),  # Also returned when not at page bottom.
+            ([dict(heading, visible=False)], ["上一节", "目标节"]),
+            ([dict(heading, t="目标节的正文")], ["上一节", "目标节"]),
+            ([heading], ["上一节", "目标节", "目标节"]),
+            ([heading, dict(heading, y=400)], ["上一节", "目标节"]),
+        ]
+        with patch("export_precise._selected_catalog_index", return_value=0):
+            for chars, titles in cases:
+                with self.subTest(chars=chars, titles=titles):
+                    page = AsyncMock()
+                    page.evaluate.return_value = chars
+                    self.assertFalse(await _catalog_index_matches(page, 1, titles))
+
+    async def test_normal_highlight_needs_no_fallback(self):
+        page = AsyncMock()
+        with patch("export_precise._selected_catalog_index", return_value=1):
+            self.assertTrue(await _catalog_index_matches(page, 1, ["上一节", "目标节"]))
+        page.evaluate.assert_not_called()
+
+    async def test_unknown_or_later_highlight_does_not_use_fallback(self):
+        for index in (-1, 2):
+            page = AsyncMock()
+            with patch("export_precise._selected_catalog_index", return_value=index):
+                self.assertFalse(await _catalog_index_matches(
+                    page, 1, ["上一节", "目标节", "下一节"]))
+            page.evaluate.assert_not_called()
 
 
 class CatalogTitleTests(unittest.TestCase):

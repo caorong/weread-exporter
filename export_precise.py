@@ -484,6 +484,39 @@ async def _selected_catalog_index(page):
     }""")
 
 
+async def _catalog_index_matches(page, expected_index, catalog_titles):
+    """Accept a bottom-of-page heading when the catalog highlight lags behind."""
+    current_index = await _selected_catalog_index(page)
+    if current_index == expected_index:
+        return True
+    if not 0 <= current_index < expected_index < len(catalog_titles):
+        return False
+    title_key = canonical_title(catalog_titles[expected_index])
+    if not title_key or sum(
+            canonical_title(title) == title_key for title in catalog_titles) != 1:
+        return False
+
+    chars = await page.evaluate("""() => {
+        const maxY = Math.max(0, document.documentElement.scrollHeight - innerHeight);
+        if (window.scrollY < maxY - 2) return [];
+        return Array.from(document.querySelectorAll('.renderTargetContent .wr_absolute'))
+            .map(el => {
+                const r = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return {t: el.textContent || '', x: r.left, y: r.top,
+                    visible: r.width > 0 && r.height > 0 && r.top >= 0 &&
+                        r.bottom <= innerHeight && r.left >= 0 && r.right <= innerWidth &&
+                        style.display !== 'none' && style.visibility !== 'hidden'};
+            }).filter(c => c.t.trim());
+    }""")
+    # Reconstruct whole lines: the reader usually stores one DOM node per glyph.
+    # Reject partially clipped lines instead of matching a visible title prefix.
+    hidden_rows = {round(c["y"] / 3) * 3 for c in chars if not c["visible"]}
+    matches = [line for line in chars_to_lines(chars)
+               if canonical_title(line["text"]) == title_key]
+    return len(matches) == 1 and matches[0]["y"] not in hidden_rows
+
+
 async def _open_catalog(page):
     if not await _catalog_is_open(page):
         await page.click("button.readerControls_item.catalog", timeout=5000)
@@ -504,9 +537,8 @@ async def _wait_for_catalog_closed(page, timeout=5):
 async def _wait_for_catalog_index(page, expected_index, catalog_titles, timeout=8):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        current_index = await _selected_catalog_index(page)
-        if current_index == expected_index:
-            return current_index
+        if await _catalog_index_matches(page, expected_index, catalog_titles):
+            return expected_index
         await asyncio.sleep(0.2)
     current_index = await _selected_catalog_index(page)
     expected_title = catalog_titles[expected_index]
@@ -731,15 +763,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
             if len(catalog_levels) != len(catalog_titles):
                 catalog_levels = [1] * len(catalog_titles)
 
-            current_index = await _selected_catalog_index(page)
-            if current_index != target_index:
-                actual_title = (
-                    catalog_titles[current_index]
-                    if 0 <= current_index < len(catalog_titles) else "(无法识别)")
-                raise ExportError(
-                    f"起始章节校验失败: 期望第 {target_index + 1} 项"
-                    f"「{catalog_titles[target_index]}」，实际第 {current_index + 1} 项"
-                    f"「{actual_title}」")
+            current_index = await _wait_for_catalog_index(
+                page, target_index, catalog_titles)
             if target_index != start_idx - 1:
                 raise ExportError(
                     f"断点编号不一致: 文件将从 {start_idx:04d} 开始，"
@@ -811,8 +836,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                             current_window = sections.get(current_index, [])
                             found_next = complete.get(current_index, False)
                             cache_future_sections(sections, complete)
-                            visible_index = await _selected_catalog_index(page)
-                            if visible_index != current_index and not found_next:
+                            if (not found_next and not await _catalog_index_matches(
+                                    page, current_index, catalog_titles)):
                                 break
                             new_blocks = merge_block_sequences(
                                 new_blocks, current_window)
@@ -878,12 +903,8 @@ async def run_session(book_id, md_dir, raw_dir, start_idx, seen_imgs,
                 next_index = current_index + 1
                 ch_blocks = []
                 await _click_catalog_index(page, next_index, catalog_titles)
-                selected_index = await _selected_catalog_index(page)
-                if selected_index != next_index:
-                    raise ExportError(
-                        f"章节定位失败: 期望目录下标 {next_index}，"
-                        f"实际 {selected_index}")
-                current_index = selected_index
+                current_index = await _wait_for_catalog_index(
+                    page, next_index, catalog_titles)
                 current_chapter = catalog_titles[current_index]
 
             return (book_title, book_author, chapters_this_session,
