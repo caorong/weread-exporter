@@ -341,7 +341,16 @@ def heading_span(blocks, title, start=0):
         for j in range(i, min(i + 6, len(blocks))):
             if blocks[j].get("type") != "text":
                 break
-            value += canonical_title(blocks[j].get("text", ""))
+            part = canonical_title(blocks[j].get("text", ""))
+            # Printed headings may replace a catalog colon with a line break:
+            # "附录：方法索引" -> ["附录", "方法索引"]. Only restore a
+            # separator at a real block boundary, keeping full-title matching.
+            if j > i and value and part and not key.startswith(value + part):
+                for separator in ("：", ":"):
+                    if key.startswith(value + separator + part):
+                        value += separator
+                        break
+            value += part
             if value == key:
                 return i, j + 1
             if not key.startswith(value):

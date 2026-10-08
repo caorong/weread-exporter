@@ -15,6 +15,7 @@ from export_precise import (
     capture_catalog_section,
     capture_verified_section,
     get_last_chapter_title,
+    heading_span,
     merge_block_sequences,
     merge_positioned_blocks,
     main,
@@ -131,6 +132,35 @@ class CatalogTitleTests(unittest.TestCase):
         self.assertEqual(resolve_catalog_title(" 第一章  开始 ", self.titles), "第一章 开始")
         self.assertEqual(resolve_catalog_title("尾声当前读到 99%", self.titles), "尾声")
         self.assertEqual(resolve_catalog_title("未知章节", self.titles), "")
+
+    def test_catalog_colon_can_be_replaced_by_heading_line_break(self):
+        blocks = [{"type": "text", "text": text} for text in
+                  ["附录", "方法索引与思维模型清单", "附录正文"]]
+        for separator in ("：", ":"):
+            title = "附录" + separator + "方法索引与思维模型清单"
+            self.assertEqual(heading_span(blocks, title), (0, 2))
+            sections, _ = partition_catalog_sections(blocks, 0, [title])
+            self.assertEqual(sections[0], [blocks[2]])
+            previous = [{"type": "text", "text": "上一节"},
+                        {"type": "text", "text": "上一节正文"}]
+            sections, complete = partition_catalog_sections(
+                previous + blocks, 0, ["上一节", title])
+            self.assertEqual(sections[0], [previous[1]])
+            self.assertEqual(sections[1], [blocks[2]])
+            self.assertTrue(complete[0])
+
+    def test_colon_heading_still_requires_full_adjacent_title(self):
+        title = "附录：方法索引与思维模型清单"
+        for texts in (["附录", "方法索引"],
+                      ["附录", "其他正文", "方法索引与思维模型清单"],
+                      ["附录方法索引与思维模型清单"],
+                      ["附录", "方法索引与思维模型清单的介绍"]):
+            blocks = [{"type": "text", "text": text} for text in texts]
+            self.assertIsNone(heading_span(blocks, title))
+        self.assertIsNone(heading_span([
+            {"type": "text", "text": "附录"},
+            {"type": "img", "src": "figure.png"},
+            {"type": "text", "text": "方法索引与思维模型清单"}], title))
 
     def test_selects_first_or_next_catalog_title(self):
         self.assertEqual(next_catalog_title(self.titles), "版权信息")
@@ -300,6 +330,16 @@ class SectionCaptureTests(unittest.IsolatedAsyncioTestCase):
                                ("男命婚配忌日", 20255), ("目标正文", 20318)]]}
         blocks, _, title_only = await self.capture([snapshot], ["男命婚配忌日", "下一章"])
         self.assertEqual([b["text"] for b in blocks], ["目标正文"])
+        self.assertFalse(title_only)
+
+    async def test_appendix_with_colon_replaced_by_line_break_is_captured(self):
+        snapshot = {"y": 405, "maxY": 405, "height": 900, "images": [],
+                    "chars": [{"t": text, "x": 0, "y": y} for text, y in
+                              [("附录", 558), ("方法索引与思维模型清单", 633),
+                               ("附录正文", 966)]]}
+        blocks, _, title_only = await self.capture(
+            [snapshot], ["附录：方法索引与思维模型清单"])
+        self.assertEqual([b["text"] for b in blocks], ["附录正文"])
         self.assertFalse(title_only)
 
     async def test_missing_target_heading_is_not_silently_saved(self):
